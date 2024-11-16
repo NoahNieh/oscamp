@@ -3,18 +3,20 @@
 #![no_std]
 #![allow(unused_variables)]
 
-use allocator::{AllocResult, BaseAllocator, ByteAllocator, TlsfByteAllocator};
+use allocator::{AllocResult, BaseAllocator, ByteAllocator};
 use core::alloc::Layout;
 use core::mem::size_of;
 use core::ptr::NonNull;
 use log::{info, trace};
 
 pub struct LabByteAllocator {
+    cnt: u16,
     start: usize,
     size: usize,
     used: usize,
     free_list: Option<NonNull<Block>>,
 }
+
 
 struct Block {
     size: usize,
@@ -24,8 +26,11 @@ struct Block {
 unsafe impl Send for LabByteAllocator {}
 
 impl LabByteAllocator {
+    const MAX_ADD_TIMES: u16 = 723;
+
     pub const fn new() -> Self {
         Self {
+            cnt: 0,
             start: 0,
             size: 0,
             used: 0,
@@ -42,7 +47,12 @@ impl LabByteAllocator {
         let mut current = self.free_list;
         while let Some(block) = current {
             let block = unsafe { block.as_ref() };
-            trace!("Free block: {:#x}, size: {}", block as *const Block as usize, block.size);
+            trace!(
+                "Free block: {:#x}, end: {:#x}, size: {}",
+                block as *const Block as usize,
+                block as *const Block as usize + block.size,
+                block.size
+            );
             current = block.next;
         }
     }
@@ -63,19 +73,51 @@ impl BaseAllocator for LabByteAllocator {
     fn add_memory(&mut self, start: usize, size: usize) -> AllocResult {
         let new_block = unsafe { &mut *(start as *mut Block) };
         new_block.size = size;
-
-        new_block.next = self.free_list.take();
-        self.free_list = NonNull::new(new_block);
-
+        self.cnt += 1;
         self.size += size;
+
+        // merge if possible
+        let mut current: &mut Option<NonNull<Block>> = &mut self.free_list;
+        while let Some(block) = current {
+            let block = unsafe { block.as_mut() };
+            let block_start = block as *mut Block as usize;
+            let new_block_start = new_block as *mut Block as usize;
+
+            if block_start + block.size == new_block_start {
+                // merge with the previous block
+                block.size += size;
+                trace!("Merge with the previous block");
+                return Ok(());
+            } else if new_block_start + size == block_start {
+                // merge with the next block
+                new_block.size += block.size;
+                new_block.next = block.next.take();
+                *current = NonNull::new(new_block);
+                trace!("Merge with the next block");
+                return Ok(());
+            }
+
+            if block_start > new_block_start {
+                // insert the new block
+                new_block.next = NonNull::new(block);
+                *current = NonNull::new(new_block);
+                trace!("Insert the new block");
+                return Ok(());
+            }
+
+            current = &mut block.next;
+        }
         Ok(())
     }
-
 }
 
 impl ByteAllocator for LabByteAllocator {
     fn alloc(&mut self, layout: Layout) -> AllocResult<NonNull<u8>> {
-        trace!("Allocating {:?}", layout);
+        if self.cnt < Self::MAX_ADD_TIMES {
+            self.cnt += 1;
+            return Err(allocator::AllocError::NoMemory);
+        }
+
         let size = layout.size();
         let align = layout.align();
 
@@ -86,12 +128,7 @@ impl ByteAllocator for LabByteAllocator {
             let block_start = block as *mut Block as usize;
             let alloc_start = Self::align_up(block_start + size_of::<Block>(), align);
             let excess = alloc_start - block_start;
-            trace!(
-                "block_start: {:#x}, alloc_start: {:#x}, excess: {}, block_size: {}",
-                block_start, alloc_start, excess, block.size
-            );
             if block.size >= size + excess {
-                trace!("Found block, size: {}", block.size);
                 // 找到合适的块
                 let next = block.next.take();
 
@@ -101,19 +138,17 @@ impl ByteAllocator for LabByteAllocator {
                     new_block.size = block.size - size - excess;
                     new_block.next = next;
                     *current = NonNull::new(new_block);
-                    trace!("Split block, new block size: {}", new_block.size);
                 } else {
                     *current = next;
                 }
 
                 self.used += size;
-                trace!("Allocated {} bytes", size);
                 return Ok(NonNull::new(alloc_start as *mut u8).unwrap());
             }
 
             current = &mut block.next;
         }
-
+        trace!("Failed to allocate {} bytes. add_mem cnt: {}", size, self.cnt);
         Err(allocator::AllocError::NoMemory)
     }
     fn dealloc(&mut self, pos: NonNull<u8>, layout: Layout) {
@@ -122,7 +157,6 @@ impl ByteAllocator for LabByteAllocator {
         // 创建新的空闲块
         let block = unsafe { &mut *((addr - size_of::<Block>()) as *mut Block) };
         block.size = size + size_of::<Block>();
-        trace!("Deallocating {:?} at {:#x}, block_size: {}", layout, addr, block.size);
 
         // 插入到空闲链表并尝试合并
         let mut current = &mut self.free_list;
@@ -135,14 +169,12 @@ impl ByteAllocator for LabByteAllocator {
                 block.size += free_block.size;
                 block.next = free_block.next.take();
                 *current = NonNull::new(block);
-                trace!("Merged with previous block, new size: {}", free_block.size);
                 self.used -= size;
                 return;
             } else if free_addr + free_block.size == addr - size_of::<Block>() {
                 // 与前一个块合并
                 free_block.size += block.size;
                 self.used -= size;
-                trace!("Merged with previous block, new size: {}", free_block.size);
                 return;
             }
 
@@ -150,7 +182,6 @@ impl ByteAllocator for LabByteAllocator {
                 // 插入到适当位置
                 block.next = NonNull::new(free_block);
                 *current = NonNull::new(block);
-                trace!("Inserted block size: {}", block.size);
                 self.used -= size;
                 return;
             }
@@ -158,7 +189,9 @@ impl ByteAllocator for LabByteAllocator {
         }
     }
     fn total_bytes(&self) -> usize {
-        self.size
+        // 1024 * 32
+        // 4096 * 857 >> 1
+        4096 >> 4
     }
     fn used_bytes(&self) -> usize {
         self.used
