@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 
-sudo apt update && sudo apt install -y make cmake build-essential
+sudo apt update && sudo apt install -y make cmake build-essential dosfstools
 if [ $? -ne 0 ]; then
     exit 1
 fi
@@ -28,6 +28,7 @@ cat > env_info << EOF
 -----info-----------
 qemu: $(qemu-system-riscv64 --version | head -n1)
 cargo: $(cargo --version)
+mkfs.fat: $(mkfs.fat --help | head -n1)
 EOF
 
 cat env_info 
